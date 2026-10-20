@@ -49,9 +49,9 @@ yt-dlp -f 'bv*[height<=1080]+ba' -o src.mp4 URL && asciivid src.mp4 out.mp4
 | `--color` | | Colour glyphs with the source pixel colour |
 | `--shade` | `0.3` | How much glyph brightness follows luminance (0 = flat, 1 = full) |
 | `--saturation` | `1.5` | Colour saturation multiplier for `--color` |
-| `--bg-fill` | `0` | Tint each cell's background with its glyph colour (0 = none, 1 = solid) |
+| `--bg-fill` | `0.3` with `--color`, else `0` | Tint each cell's background with its glyph colour (0 = none, 1 = solid) |
 | `--contrast` / `--brightness` / `--gamma` | `1` / `0` / `1` | Luminance adjustments (`gamma < 1` lifts shadows) |
-| `--invert` | | Invert luminance |
+| `--invert[=auto\|on\|off]` | `auto` | Invert luminance. `auto` inverts light-background images and GIFs in mono mode so the background stays dark; bare `--invert` means `on` |
 | `--no-auto-levels` | | Don't stretch each frame's luminance to use the full ramp |
 | `--equalize` | `0.5` | How much histogram equalization auto-levels mixes in (0 = plain stretch, 1 = full) |
 | `--sharpen` | `0` | Sharpen the downscaled image so edges survive as glyphs |

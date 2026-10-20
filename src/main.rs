@@ -56,12 +56,15 @@ struct Args {
     #[arg(long, default_value_t = 1.5)]
     saturation: f32,
     /// Tint each cell's background with its glyph colour (0 = none, 1 = solid)
-    #[arg(long, default_value_t = 0.0)]
-    bg_fill: f32,
-
-    /// Invert luminance
+    /// [default: 0.3 with --color, else 0]
     #[arg(long)]
-    invert: bool,
+    bg_fill: Option<f32>,
+
+    /// Invert luminance; `auto` inverts light-background images and GIFs in mono mode so
+    /// the background stays dark. Bare --invert means `on`
+    #[arg(long, value_enum, default_value_t = Invert::Auto, num_args = 0..=1,
+          default_missing_value = "on", require_equals = true)]
+    invert: Invert,
     /// Don't stretch each frame's luminance range to use the full ramp
     #[arg(long)]
     no_auto_levels: bool,
@@ -129,6 +132,27 @@ impl Charset {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
+enum Invert {
+    Auto,
+    On,
+    Off,
+}
+
+/// Mean luminance of the outermost ring of cells.
+fn border_mean(lum: &[f32], cols: usize, rows: usize) -> f32 {
+    let edge = |i: usize| {
+        let (r, c) = (i / cols, i % cols);
+        r == 0 || r == rows - 1 || c == 0 || c == cols - 1
+    };
+    let (sum, n) = lum
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| edge(i))
+        .fold((0.0, 0), |(s, n), (_, &l)| (s + l, n + 1));
+    sum / n.max(1) as f32
 }
 
 struct Atlas {
@@ -291,6 +315,7 @@ struct Probe {
     fps_f: f64,
     duration: Option<f64>,
     is_gif: bool,
+    is_still: bool,
 }
 
 fn probe(input: &str) -> Result<Probe> {
@@ -304,14 +329,17 @@ fn probe(input: &str) -> Result<Probe> {
         bail!("ffprobe failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     let (mut width, mut height, mut fps, mut duration) = (0, 0, String::new(), None);
-    let mut is_gif = false;
+    let (mut is_gif, mut is_still) = (false, false);
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         match line.split_once('=') {
             Some(("width", v)) => width = v.parse()?,
             Some(("height", v)) => height = v.parse()?,
             Some(("r_frame_rate", v)) => fps = v.to_string(),
             Some(("duration", v)) => duration = v.parse().ok(),
-            Some(("format_name", v)) => is_gif = v == "gif",
+            Some(("format_name", v)) => {
+                is_gif = v == "gif";
+                is_still = v == "image2" || v.ends_with("_pipe");
+            }
             _ => {}
         }
     }
@@ -322,7 +350,7 @@ fn probe(input: &str) -> Result<Probe> {
         Some((n, d)) => n.parse::<f64>()? / d.parse::<f64>()?,
         None => fps.parse()?,
     };
-    Ok(Probe { width, height, fps, fps_f, duration, is_gif })
+    Ok(Probe { width, height, fps, fps_f, duration, is_gif, is_still })
 }
 
 /// Exact frame count by counting packets; cheap for GIFs, which have one frame per packet.
@@ -527,7 +555,15 @@ fn main() -> Result<()> {
     let lin = |c: [f32; 3]| c.map(|v| to_lin[v.clamp(0.0, 255.0) as usize]);
     let bg_lin = lin(bg);
     let lut = atlas.lut(!args.no_sort);
-    let bg_fill = args.bg_fill.clamp(0.0, 1.0);
+    let bg_fill = args.bg_fill.unwrap_or(if args.color { 0.3 } else { 0.0 }).clamp(0.0, 1.0);
+    // Auto decides from the first frame, so it's limited to stills and GIFs where that frame
+    // is representative (videos fade in and change scenes). It's also mono-only: inverting
+    // colour output would leave bright regions sparse.
+    let mut invert_choice = match args.invert {
+        Invert::On => Some(true),
+        Invert::Auto if !args.color && (info.is_gif || info.is_still) => None,
+        Invert::Auto | Invert::Off => Some(false),
+    };
 
     // Loop GIFs in preview until the window is closed.
     let looping = args.preview && info.is_gif && !args.no_loop;
@@ -571,6 +607,13 @@ fn main() -> Result<()> {
         for (l, px) in lum.iter_mut().zip(src.chunks_exact(3)) {
             *l = (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32) / 255.0;
         }
+        let invert = *invert_choice.get_or_insert_with(|| {
+            let light = border_mean(&lum, cols, rows) > 0.7;
+            if light {
+                eprintln!("light background: inverting (--invert=off to keep it)");
+            }
+            light
+        });
         if !args.no_auto_levels {
             let next = level_curve(&lum, eq);
             // Ease toward the new curve so levels don't pump frame to frame.
@@ -588,7 +631,7 @@ fn main() -> Result<()> {
             };
             l = ((l - 0.5) * args.contrast + 0.5 + args.brightness).clamp(0.0, 1.0);
             l = l.powf(args.gamma);
-            if args.invert {
+            if invert {
                 l = 1.0 - l;
             }
             if args.jitter > 0.0 {
