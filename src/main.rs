@@ -227,6 +227,16 @@ fn probe(input: &str) -> Result<Probe> {
     Ok(Probe { width, height, fps, fps_f, duration, is_gif })
 }
 
+/// Exact frame count by counting packets; cheap for GIFs, which have one frame per packet.
+fn count_frames(input: &str) -> Option<u64> {
+    let out = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "v:0", "-count_packets"])
+        .args(["-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", input])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok().filter(|&n| n > 0)
+}
+
 fn seek_args(args: &Args) -> Vec<String> {
     let mut v = Vec::new();
     if let Some(s) = &args.start {
@@ -421,13 +431,15 @@ fn main() -> Result<()> {
         burst_left: 0,
     };
 
-    let total_frames = info
-        .duration
-        .map(|d| {
-            let d = args.duration.as_deref().and_then(|t| t.parse::<f64>().ok()).unwrap_or(d);
-            (d * info.fps_f).round() as u64
+    let whole_file = args.start.is_none() && args.duration.is_none();
+    let total_frames = (info.is_gif && whole_file)
+        .then(|| count_frames(&args.input))
+        .flatten()
+        .or_else(|| {
+            let d = args.duration.as_deref().and_then(|t| t.parse::<f64>().ok()).or(info.duration)?;
+            Some((d * info.fps_f).round() as u64)
         })
-        .filter(|&n| n > 0 && !looping);
+        .filter(|&n| n > 0);
     let started = std::time::Instant::now();
     let mut frame = 0u64;
 
@@ -513,6 +525,11 @@ fn main() -> Result<()> {
         if frame % 15 == 0 {
             let fps = frame as f64 / started.elapsed().as_secs_f64();
             match total_frames {
+                Some(t) if looping => eprint!(
+                    "\rframe {}/{t} (loop {}) {fps:.1} fps   ",
+                    (frame - 1) % t + 1,
+                    (frame - 1) / t + 1
+                ),
                 Some(t) => eprint!("\rframe {frame}/{t} ({:.0}%) {fps:.1} fps   ", frame as f64 / t as f64 * 100.0),
                 None => eprint!("\rframe {frame} {fps:.1} fps   "),
             }
