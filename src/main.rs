@@ -83,6 +83,9 @@ struct Args {
     /// Play in an ffplay window instead of writing a file
     #[arg(long)]
     preview: bool,
+    /// Play GIFs once in --preview instead of looping them
+    #[arg(long)]
+    no_loop: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -189,12 +192,13 @@ struct Probe {
     fps: String,
     fps_f: f64,
     duration: Option<f64>,
+    is_gif: bool,
 }
 
 fn probe(input: &str) -> Result<Probe> {
     let out = Command::new("ffprobe")
         .args(["-v", "error", "-select_streams", "v:0"])
-        .args(["-show_entries", "stream=width,height,r_frame_rate:format=duration"])
+        .args(["-show_entries", "stream=width,height,r_frame_rate:format=duration,format_name"])
         .args(["-of", "default=nw=1", input])
         .output()
         .context("failed to run ffprobe")?;
@@ -202,12 +206,14 @@ fn probe(input: &str) -> Result<Probe> {
         bail!("ffprobe failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     let (mut width, mut height, mut fps, mut duration) = (0, 0, String::new(), None);
+    let mut is_gif = false;
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         match line.split_once('=') {
             Some(("width", v)) => width = v.parse()?,
             Some(("height", v)) => height = v.parse()?,
             Some(("r_frame_rate", v)) => fps = v.to_string(),
             Some(("duration", v)) => duration = v.parse().ok(),
+            Some(("format_name", v)) => is_gif = v == "gif",
             _ => {}
         }
     }
@@ -218,7 +224,7 @@ fn probe(input: &str) -> Result<Probe> {
         Some((n, d)) => n.parse::<f64>()? / d.parse::<f64>()?,
         None => fps.parse()?,
     };
-    Ok(Probe { width, height, fps, fps_f, duration })
+    Ok(Probe { width, height, fps, fps_f, duration, is_gif })
 }
 
 fn seek_args(args: &Args) -> Vec<String> {
@@ -232,9 +238,10 @@ fn seek_args(args: &Args) -> Vec<String> {
     v
 }
 
-fn spawn_decoder(args: &Args, cols: usize, rows: usize) -> Result<Child> {
+fn spawn_decoder(args: &Args, cols: usize, rows: usize, looping: bool) -> Result<Child> {
     Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error"])
+        .args(if looping { &["-stream_loop", "-1"][..] } else { &[] })
         .args(seek_args(args))
         .args(["-i", &args.input, "-an"])
         .args(["-vf", &format!("scale={cols}:{rows}:flags=area,format=rgb24")])
@@ -249,7 +256,7 @@ fn spawn_sink(args: &Args, w: usize, h: usize, fps: &str) -> Result<Child> {
     let mut cmd;
     if args.preview {
         cmd = Command::new("ffplay");
-        cmd.args(["-hide_banner", "-loglevel", "error", "-window_title", "asciivid"])
+        cmd.args(["-hide_banner", "-loglevel", "error", "-autoexit", "-window_title", "asciivid"])
             .args(["-f", "rawvideo", "-pixel_format", "rgb24"])
             .args(["-video_size", &size, "-framerate", fps, "-i", "-"]);
     } else {
@@ -397,7 +404,9 @@ fn main() -> Result<()> {
     let bg = parse_hex(&args.bg)?;
     let bg_u8 = bg.map(|v| v as u8);
 
-    let mut decoder = spawn_decoder(&args, cols, rows)?;
+    // Loop GIFs in preview until the window is closed.
+    let looping = args.preview && info.is_gif && !args.no_loop;
+    let mut decoder = spawn_decoder(&args, cols, rows, looping)?;
     let mut sink = spawn_sink(&args, out_w, out_h, &info.fps)?;
     let mut src_out = decoder.stdout.take().unwrap();
     let mut sink_in = sink.stdin.take().unwrap();
@@ -418,7 +427,7 @@ fn main() -> Result<()> {
             let d = args.duration.as_deref().and_then(|t| t.parse::<f64>().ok()).unwrap_or(d);
             (d * info.fps_f).round() as u64
         })
-        .filter(|&n| n > 0);
+        .filter(|&n| n > 0 && !looping);
     let started = std::time::Instant::now();
     let mut frame = 0u64;
 
