@@ -41,20 +41,27 @@ yt-dlp -f 'bv*[height<=1080]+ba' -o src.mp4 URL && asciivid src.mp4 out.mp4
 | `--cols` | | Number of character columns (overrides `--width`) |
 | `--font` | `fc-match monospace` | Monospace font file |
 | `--font-size` | `10` | Font size in px. Smaller is denser |
+| `--bold` | | Thicken glyph strokes by a pixel for brighter, punchier output |
 | `--charset` | `wd2` | `wd2`, `classic`, `binary`, `blocks`, `dense` |
 | `--ramp` | | Custom character ramp, e.g. `" .:01#"` |
-| `--no-sort` | | Keep the ramp order instead of sorting by ink density |
+| `--no-sort` | | Keep the ramp order and spread it evenly, instead of sorting and matching glyphs by ink density |
 | `--fg` / `--bg` | `#ffffff` / `#000000` | Glyph and background colours |
 | `--color` | | Colour glyphs with the source pixel colour |
-| `--shade` | `0.6` | How much glyph brightness follows luminance (0 = flat, 1 = full) |
+| `--shade` | `0.3` | How much glyph brightness follows luminance (0 = flat, 1 = full) |
+| `--saturation` | `1.5` | Colour saturation multiplier for `--color` |
+| `--bg-fill` | `0` | Tint each cell's background with its glyph colour (0 = none, 1 = solid) |
 | `--contrast` / `--brightness` / `--gamma` | `1` / `0` / `1` | Luminance adjustments (`gamma < 1` lifts shadows) |
 | `--invert` | | Invert luminance |
+| `--no-auto-levels` | | Don't stretch each frame's luminance to use the full ramp |
+| `--equalize` | `0.5` | How much histogram equalization auto-levels mixes in (0 = plain stretch, 1 = full) |
+| `--sharpen` | `0` | Sharpen the downscaled image so edges survive as glyphs |
 | `--jitter` | `0` | Per-cell luminance noise each frame (character shimmer) |
 | `--glitch` | `0` | 0–1: band tearing, block dropouts, scrambles, vertical rolls, bursts |
 | `--seed` | `1337` | RNG seed for jitter and glitches |
 | `--start` / `--duration` | | Passed to ffmpeg as `-ss` / `-t` |
 | `--crf` | `18` | x264 quality (lower is better) |
 | `--preview` | | Play in an ffplay window instead of writing a file |
+| `--no-loop` | | Play GIFs once in `--preview` instead of looping until the window is closed |
 
 ## License
 

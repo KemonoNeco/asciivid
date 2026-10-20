@@ -26,6 +26,9 @@ struct Args {
     /// Font size in pixels
     #[arg(long, default_value_t = 10.0)]
     font_size: f32,
+    /// Thicken glyph strokes by a pixel for brighter, punchier output
+    #[arg(long)]
+    bold: bool,
 
     /// Built-in character ramp
     #[arg(long, value_enum, default_value_t = Charset::Wd2)]
@@ -47,12 +50,28 @@ struct Args {
     #[arg(long)]
     color: bool,
     /// How much glyph brightness follows the source luminance (0 = flat, 1 = full)
-    #[arg(long, default_value_t = 0.6)]
+    #[arg(long, default_value_t = 0.3)]
     shade: f32,
+    /// Colour saturation multiplier for --color
+    #[arg(long, default_value_t = 1.5)]
+    saturation: f32,
+    /// Tint each cell's background with its glyph colour (0 = none, 1 = solid)
+    #[arg(long, default_value_t = 0.0)]
+    bg_fill: f32,
 
     /// Invert luminance
     #[arg(long)]
     invert: bool,
+    /// Don't stretch each frame's luminance range to use the full ramp
+    #[arg(long)]
+    no_auto_levels: bool,
+    /// Blend of histogram equalization into auto-levels; spreads glyphs across the tones
+    /// actually present (0 = plain stretch, 1 = full equalization)
+    #[arg(long, default_value_t = 0.5)]
+    equalize: f32,
+    /// Sharpen the downscaled image so edges survive as glyphs (0 = off)
+    #[arg(long, default_value_t = 0.0)]
+    sharpen: f32,
     #[arg(long, default_value_t = 1.0)]
     contrast: f32,
     #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
@@ -119,22 +138,93 @@ struct Atlas {
     glyphs: Vec<Vec<u8>>,
 }
 
-fn build_atlas(font_bytes: &[u8], px: f32, ramp: &str, sort: bool) -> Result<Atlas> {
+impl Atlas {
+    /// Maps 8-bit luminance to a glyph index. With `by_density`, each level picks the glyph
+    /// whose on-screen brightness (mean coverage, sRGB-encoded) is closest; otherwise the
+    /// ramp is spread evenly.
+    fn lut(&self, by_density: bool) -> [u8; 256] {
+        let n = self.glyphs.len();
+        let t: Vec<f32> = if by_density {
+            let p: Vec<f32> = self
+                .glyphs
+                .iter()
+                .map(|g| linear_to_srgb(g.iter().map(|&a| a as f32).sum::<f32>() / (g.len() as f32 * 255.0)))
+                .collect();
+            let (lo, hi) = (p[0], p[n - 1].max(p[0] + 1e-6));
+            p.iter().map(|v| (v - lo) / (hi - lo)).collect()
+        } else {
+            (0..n).map(|i| i as f32 / (n - 1) as f32).collect()
+        };
+        std::array::from_fn(|l| {
+            let l = l as f32 / 255.0;
+            (0..n).min_by(|&a, &b| (t[a] - l).abs().total_cmp(&(t[b] - l).abs())).unwrap() as u8
+        })
+    }
+}
+
+fn srgb_to_linear(v: f32) -> f32 {
+    if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+}
+
+fn linear_to_srgb(v: f32) -> f32 {
+    if v <= 0.0031308 { v * 12.92 } else { 1.055 * v.powf(1.0 / 2.4) - 0.055 }
+}
+
+/// Tone curve for one frame: a 1%–99% percentile stretch blended with histogram
+/// equalization by `eq`.
+fn level_curve(lum: &[f32], eq: f32) -> [f32; 256] {
+    let mut hist = [0u32; 256];
+    for &l in lum {
+        hist[(l * 255.0) as usize] += 1;
+    }
+    let total = lum.len() as f32;
+    let mut cdf = [0f32; 256];
+    let mut acc = 0.0;
+    for (c, &n) in cdf.iter_mut().zip(&hist) {
+        acc += n as f32;
+        *c = acc / total;
+    }
+    let find = |q: f32| cdf.iter().position(|&c| c >= q).unwrap_or(255) as f32 / 255.0;
+    let (mut lo, mut hi) = (find(0.01), find(0.99));
+    // Don't blow a near-flat frame up into noise.
+    let mid = (lo + hi) / 2.0;
+    lo = lo.min(mid - 0.15).max(0.0);
+    hi = hi.max(mid + 0.15).min(1.0);
+    let (c_lo, c_hi) = (cdf[(lo * 255.0) as usize], cdf[(hi * 255.0) as usize].max(1e-6));
+    std::array::from_fn(|i| {
+        let l = i as f32 / 255.0;
+        let stretch = (l - lo) / (hi - lo);
+        let equal = (cdf[i] - c_lo) / (c_hi - c_lo).max(1e-6);
+        (stretch + (equal - stretch) * eq).clamp(0.0, 1.0)
+    })
+}
+
+fn build_atlas(font_bytes: &[u8], px: f32, ramp: &str, sort: bool, bold: bool) -> Result<Atlas> {
     let font = fontdue::Font::from_bytes(font_bytes, fontdue::FontSettings::default())
         .map_err(|e| anyhow::anyhow!("failed to load font: {e}"))?;
     let lm = font
         .horizontal_line_metrics(px)
         .context("font has no horizontal metrics")?;
     let cw = font.metrics('M', px).advance_width.round().max(1.0) as usize;
-    let ch = (lm.ascent - lm.descent).ceil().max(1.0) as usize;
-    let baseline = lm.ascent.round() as i32;
 
-    let mut glyphs = Vec::new();
+    let mut raster = Vec::new();
     for c in ramp.chars() {
         if c != ' ' && font.lookup_glyph_index(c) == 0 {
             bail!("font has no glyph for {c:?}; pick another --font or --ramp");
         }
-        let (m, bmp) = font.rasterize(c, px);
+        raster.push(font.rasterize(c, px));
+    }
+    // Size rows to the ramp's actual ink (plus a pixel of air) rather than the font's full
+    // line height, so glyphs fill their cells instead of leaving blank bands between rows.
+    let inked = || raster.iter().map(|(m, _)| m).filter(|m| m.height > 0);
+    let line = (lm.ascent - lm.descent).ceil().max(1.0) as i32;
+    let top = inked().map(|m| m.ymin + m.height as i32).max().unwrap_or(line);
+    let bottom = inked().map(|m| m.ymin).min().unwrap_or(0);
+    let ch = (top - bottom + 1).clamp(1, line) as usize;
+    let baseline = top.min(lm.ascent.round() as i32);
+
+    let mut glyphs = Vec::new();
+    for (m, bmp) in raster {
         let mut cell = vec![0u8; cw * ch];
         let x0 = m.xmin;
         let y0 = baseline - (m.ymin + m.height as i32);
@@ -149,6 +239,14 @@ fn build_atlas(font_bytes: &[u8], px: f32, ramp: &str, sort: bool) -> Result<Atl
                     continue;
                 }
                 cell[y as usize * cw + x as usize] = bmp[gy * m.width + gx];
+            }
+        }
+        if bold {
+            // Synthetic bold: smear each row one pixel right.
+            for row in cell.chunks_exact_mut(cw) {
+                for x in (1..cw).rev() {
+                    row[x] = row[x].max(row[x - 1]);
+                }
             }
         }
         glyphs.push(cell);
@@ -248,13 +346,21 @@ fn seek_args(args: &Args) -> Vec<String> {
     v
 }
 
+fn decode_filter(args: &Args, cols: usize, rows: usize) -> String {
+    let mut vf = format!("scale={cols}:{rows}:flags=area");
+    if args.sharpen > 0.0 {
+        vf += &format!(",unsharp=3:3:{0}:3:3:{0}", args.sharpen.min(5.0));
+    }
+    vf + ",format=rgb24"
+}
+
 fn spawn_decoder(args: &Args, cols: usize, rows: usize, looping: bool) -> Result<Child> {
     Command::new("ffmpeg")
         .args(["-hide_banner", "-loglevel", "error"])
         .args(if looping { &["-stream_loop", "-1"][..] } else { &[] })
         .args(seek_args(args))
         .args(["-i", &args.input, "-an"])
-        .args(["-vf", &format!("scale={cols}:{rows}:flags=area,format=rgb24")])
+        .args(["-vf", &decode_filter(args, cols, rows)])
         .args(["-f", "rawvideo", "-"])
         .stdout(Stdio::piped())
         .spawn()
@@ -289,6 +395,8 @@ fn spawn_sink(args: &Args, w: usize, h: usize, fps: &str) -> Result<Child> {
 struct Cell {
     glyph: u8,
     color: [f32; 3],
+    /// How far the cell background is tinted toward `color`.
+    fill: f32,
 }
 
 /// Random rectangle of cells, sized relative to the grid.
@@ -343,6 +451,7 @@ impl Glitcher {
                         cell.color = fg;
                     } else {
                         cell.glyph = 0;
+                        cell.fill = 0.0;
                     }
                 }
             }
@@ -390,7 +499,7 @@ fn main() -> Result<()> {
     let font_bytes = std::fs::read(&font_path)
         .with_context(|| format!("reading font {}", font_path.display()))?;
     let ramp = args.ramp.as_deref().unwrap_or(args.charset.ramp());
-    let atlas = build_atlas(&font_bytes, args.font_size, ramp, !args.no_sort)?;
+    let atlas = build_atlas(&font_bytes, args.font_size, ramp, !args.no_sort, args.bold)?;
     let (cw, ch) = (atlas.cw, atlas.ch);
     let n_glyphs = atlas.glyphs.len();
 
@@ -413,6 +522,12 @@ fn main() -> Result<()> {
     let fg = parse_hex(&args.fg)?;
     let bg = parse_hex(&args.bg)?;
     let bg_u8 = bg.map(|v| v as u8);
+    let to_lin: [f32; 256] = std::array::from_fn(|v| srgb_to_linear(v as f32 / 255.0));
+    let to_srgb: Vec<u8> = (0..4096).map(|i| (linear_to_srgb(i as f32 / 4095.0) * 255.0).round() as u8).collect();
+    let lin = |c: [f32; 3]| c.map(|v| to_lin[v.clamp(0.0, 255.0) as usize]);
+    let bg_lin = lin(bg);
+    let lut = atlas.lut(!args.no_sort);
+    let bg_fill = args.bg_fill.clamp(0.0, 1.0);
 
     // Loop GIFs in preview until the window is closed.
     let looping = args.preview && info.is_gif && !args.no_loop;
@@ -422,7 +537,10 @@ fn main() -> Result<()> {
     let mut sink_in = sink.stdin.take().unwrap();
 
     let mut src = vec![0u8; cols * rows * 3];
-    let mut cells = vec![Cell { glyph: 0, color: fg }; cols * rows];
+    let mut cells = vec![Cell { glyph: 0, color: fg, fill: 0.0 }; cols * rows];
+    let mut lum = vec![0f32; cols * rows];
+    let mut curve: Option<[f32; 256]> = None;
+    let eq = args.equalize.clamp(0.0, 1.0);
     let mut out = vec![0u8; out_w * out_h * 3];
     let mut rng = fastrand::Rng::with_seed(args.seed);
     let mut glitcher = Glitcher {
@@ -450,9 +568,24 @@ fn main() -> Result<()> {
             Err(e) => return Err(e).context("reading decoded frames"),
         }
 
-        for (cell, px) in cells.iter_mut().zip(src.chunks_exact(3)) {
+        for (l, px) in lum.iter_mut().zip(src.chunks_exact(3)) {
+            *l = (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32) / 255.0;
+        }
+        if !args.no_auto_levels {
+            let next = level_curve(&lum, eq);
+            // Ease toward the new curve so levels don't pump frame to frame.
+            curve = Some(match curve {
+                Some(c) => std::array::from_fn(|i| c[i] + (next[i] - c[i]) * 0.15),
+                None => next,
+            });
+        }
+
+        for ((cell, px), &l) in cells.iter_mut().zip(src.chunks_exact(3)).zip(&lum) {
             let [r, g, b] = [px[0] as f32, px[1] as f32, px[2] as f32];
-            let mut l = (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255.0;
+            let mut l = match &curve {
+                Some(c) => c[(l * 255.0) as usize],
+                None => l,
+            };
             l = ((l - 0.5) * args.contrast + 0.5 + args.brightness).clamp(0.0, 1.0);
             l = l.powf(args.gamma);
             if args.invert {
@@ -461,16 +594,19 @@ fn main() -> Result<()> {
             if args.jitter > 0.0 {
                 l = (l + (rng.f32() - 0.5) * args.jitter).clamp(0.0, 1.0);
             }
-            cell.glyph = (l * (n_glyphs - 1) as f32).round() as u8;
+            cell.glyph = lut[(l * 255.0).round() as usize];
             let base = if args.color {
                 // Normalise so dark source colours still read through the glyph shading.
                 let m = r.max(g).max(b).max(1.0);
-                [r / m * 255.0, g / m * 255.0, b / m * 255.0]
+                let c = [r / m * 255.0, g / m * 255.0, b / m * 255.0];
+                let grey = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+                c.map(|v| (grey + (v - grey) * args.saturation).clamp(0.0, 255.0))
             } else {
                 fg
             };
             let k = 1.0 - args.shade + args.shade * l;
             cell.color = base.map(|v| v * k);
+            cell.fill = bg_fill * l;
         }
 
         if glitcher.intensity > 0.0 {
@@ -484,11 +620,20 @@ fn main() -> Result<()> {
             if r >= rows {
                 return;
             }
+            let enc = |v: f32| to_srgb[(v.clamp(0.0, 1.0) * 4095.0) as usize];
             for c in 0..cols {
                 let cell = cells[r * cols + c];
-                if cell.glyph == 0 {
+                let filled = cell.fill > 0.0;
+                if cell.glyph == 0 && !filled {
                     continue;
                 }
+                // Blend in linear light so antialiased strokes keep their brightness.
+                let fg_lin = lin(cell.color);
+                let cell_bg = if filled {
+                    lin(std::array::from_fn(|k| bg[k] + (cell.color[k] - bg[k]) * cell.fill))
+                } else {
+                    bg_lin
+                };
                 let glyph = &atlas.glyphs[cell.glyph as usize];
                 for gy in 0..ch {
                     let row = gy * out_w * 3;
@@ -497,13 +642,13 @@ fn main() -> Result<()> {
                     }
                     for gx in 0..cw {
                         let a = glyph[gy * cw + gx];
-                        if a == 0 {
+                        if a == 0 && !filled {
                             continue;
                         }
                         let a = a as f32 / 255.0;
                         let i = row + (c * cw + gx) * 3;
                         for k in 0..3 {
-                            band[i + k] = (bg[k] + (cell.color[k] - bg[k]) * a) as u8;
+                            band[i + k] = enc(cell_bg[k] + (fg_lin[k] - cell_bg[k]) * a);
                         }
                     }
                 }
