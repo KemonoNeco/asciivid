@@ -1,0 +1,6 @@
+# Green phosphor binary rain.
+charset = "binary"
+fg = "#33ff66"
+bg = "#000a00"
+shade = 0.7
+jitter = 0.1

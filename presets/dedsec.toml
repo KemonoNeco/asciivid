@@ -1,0 +1,4 @@
+# White-on-black shimmer with DedSec-style glitches.
+glitch = 0.5
+jitter = 0.15
+contrast = 1.4

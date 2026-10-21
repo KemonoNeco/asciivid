@@ -1,0 +1,6 @@
+# Source colours with tinted cells and a dense ramp.
+color = true
+charset = "dense"
+saturation = 1.6
+bg_fill = 0.35
+sharpen = 1.0

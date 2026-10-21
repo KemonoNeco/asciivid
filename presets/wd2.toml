@@ -1,0 +1,5 @@
+# Closer to the Watch Dogs 2 menu: tiny binary glyphs, crushed shadows.
+font_size = 8.0
+charset = "binary"
+contrast = 1.6
+gamma = 1.3
