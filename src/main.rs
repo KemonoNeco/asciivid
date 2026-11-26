@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+mod export;
+
 /// Render any video as ASCII art into a new video file (or a live preview).
 ///
 /// Look options start from the defaults, then a --preset, then any flags given here.
@@ -14,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[command(version, after_help = presets_help())]
 struct Args {
     /// Input video, GIF or image (anything ffmpeg can read)
-    #[arg(required_unless_present = "print_preset")]
+    #[arg(required_unless_present_any = ["print_preset", "export_atlas"])]
     input: Option<String>,
     /// Output file; the extension picks the format: mp4/mov/mkv (H.264), webm (VP9),
     /// gif, png/jpg (first frame). Omit with --preview
@@ -26,6 +28,10 @@ struct Args {
     /// Print the effective look settings as TOML (save it as your own preset) and exit
     #[arg(long)]
     print_preset: bool,
+    /// Write the glyph atlas used by the hypr-shaders ASCII effect (PNG of 256 luminance
+    /// slots, plus a .json sidecar next to it) and exit
+    #[arg(long, value_name = "PNG")]
+    export_atlas: Option<PathBuf>,
 
     /// Target output width in pixels; sets the column count from the font's cell width [default: 1920]
     #[arg(long)]
@@ -162,6 +168,10 @@ fn main() -> Result<()> {
         params.validate()?;
         print!("{}", params.to_toml());
         return Ok(());
+    }
+    if let Some(png) = &args.export_atlas {
+        params.validate()?;
+        return export::export_atlas(&params, png);
     }
 
     // First Ctrl-C finishes cleanly (the output file stays playable); a second one bails.
